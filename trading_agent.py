@@ -2,7 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from binance.client import Client
-from binance.enums import *
+from binance.enums import (
+    SIDE_BUY,
+    SIDE_SELL,
+    ORDER_TYPE_MARKET,
+    ORDER_TYPE_LIMIT
+)
 import tensorflow as tf
 import pickle
 from datetime import datetime, timedelta
@@ -10,6 +15,9 @@ import time
 import plotly.graph_objects as go
 import threading
 import json
+
+# Define futures-specific order types
+ORDER_TYPE_TAKE_PROFIT_MARKET = 'TAKE_PROFIT_MARKET'
 
 def candlestick_loss(y_true, y_pred):
     # Unpack predictions
@@ -180,6 +188,7 @@ def setup_perpetual_trading(client, symbol, leverage, margin_type):
 
 def get_historical_klines(client, symbol, interval, limit):
     try:
+        # Request one extra candle to account for potential unclosed candle
         if config['is_perpetual']:
             klines = client.futures_klines(
                 symbol=symbol,
@@ -197,14 +206,18 @@ def get_historical_klines(client, symbol, interval, limit):
                                          'close_time', 'quote_asset_volume', 'number_of_trades',
                                          'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = df[col].astype(float)
         
-        # Check if the last candle is closed
+        # Filter out unclosed candles
         current_time = pd.Timestamp.now()
-        last_candle_time = df['timestamp'].iloc[-1]
-        if current_time < last_candle_time + pd.Timedelta(hours=4):
-            df = df.iloc[:-1]
+        df = df[df['close_time'] < current_time].copy()
+        
+        # Verify we have enough closed candles
+        if len(df) < limit:
+            st.error(f"Not enough closed candles available. Need at least {limit} closed candles.")
+            return pd.DataFrame()
         
         return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
