@@ -132,18 +132,21 @@ if use_binance:
                                              'close_time', 'quote_asset_volume', 'number_of_trades',
                                              'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = df[col].astype(float)
             
-            # Check if the last candle is closed
+            # Filter out unclosed candles
             current_time = pd.Timestamp.now()
-            last_candle_time = df['timestamp'].iloc[-1]
-            if current_time < last_candle_time + pd.Timedelta(hours=4):
-                # Remove the last (unclosed) candle
-                df = df.iloc[:-1]
+            df = df[df['close_time'] < current_time].copy()
+            
+            # Ensure we have enough closed candles
+            if len(df) < 100:
+                st.error("Not enough closed candles available. Need at least 100 closed candles.")
+                st.stop()
             
             # Store in session state
-            st.session_state.historical_data = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            st.session_state.historical_data = df[['timestamp', 'close_time', 'open', 'high', 'low', 'close', 'volume']]
             st.session_state.last_symbol = symbol
             st.session_state.historical_predictions = []  # Clear predictions for new symbol
             
@@ -174,19 +177,27 @@ if st.sidebar.button("Refresh Data"):
 
 # Make prediction
 if len(df) >= 100:
-    try:
-        # Make predictions for historical data if predictions list is empty
-        if not st.session_state.historical_predictions:
-            # Start from the end of the data and work backwards
-            for i in range(102):  # We want 102 predictions
-                end_idx = len(df) - i - 1  # Start from the last candle and move backwards
-                start_idx = end_idx - 100  # Get 100 candles before the end_idx
+    # Make predictions for historical data if predictions list is empty
+    if not st.session_state.historical_predictions:
+        # Start from the end of the data and work backwards
+        for i in range(102):  # We want 102 predictions
+                # Calculate which candle we're trying to predict
+                target_idx = len(df) - i - 1
+                if target_idx < 0:  # Break if we've gone too far back
+                    break
+                
+                # Get the timestamp of the candle we're trying to predict
+                target_candle_time = df['timestamp'].iloc[target_idx]
+                
+                # Get the 100 candles BEFORE this candle (these would have been available at prediction time)
+                start_idx = target_idx - 100
+                end_idx = target_idx - 1  # Exclude the target candle
                 
                 if start_idx < 0:  # Break if we don't have enough historical data
                     break
                 
-                # Get the sequence of 100 candles
-                historical_df = df.iloc[start_idx:end_idx]
+                # Get the sequence of 100 candles that were available at prediction time
+                historical_df = df.iloc[start_idx:end_idx + 1]  # +1 because end is exclusive
                 if len(historical_df) < 100:  # Skip if we don't have enough data
                     continue
                     
@@ -216,31 +227,40 @@ if len(df) >= 100:
                         historical_prediction_descaled[1])
                 ])
                 
-                # Get the actual next candle's data
-                pred_timestamp = historical_df['timestamp'].iloc[-1] + pd.Timedelta(hours=4)
-                actual_candle = df[df['timestamp'] == pred_timestamp]
+                # Get the actual candle data
+                actual_candle = df.iloc[target_idx] if target_idx < len(df) else pd.Series()
                 
                 # Store prediction and actual values
                 prediction_data = {
-                    'timestamp': pred_timestamp,
+                    'timestamp': target_candle_time,
                     'current_price': historical_current_price,
                     'pred_high': historical_prediction_descaled[0],
                     'pred_low': historical_prediction_descaled[1],
                     'pred_close': historical_prediction_descaled[2],
-                    'actual_high': actual_candle['high'].iloc[0] if not actual_candle.empty else None,
-                    'actual_low': actual_candle['low'].iloc[0] if not actual_candle.empty else None,
-                    'actual_close': actual_candle['close'].iloc[0] if not actual_candle.empty else None,
-                    'actual_open': actual_candle['open'].iloc[0] if not actual_candle.empty else None
+                    'actual_high': actual_candle['high'] if not actual_candle.empty else None,
+                    'actual_low': actual_candle['low'] if not actual_candle.empty else None,
+                    'actual_close': actual_candle['close'] if not actual_candle.empty else None,
+                    'actual_open': actual_candle['open'] if not actual_candle.empty else None
                 }
                 
                 # Insert at the beginning to maintain chronological order
                 st.session_state.historical_predictions.insert(0, prediction_data)
 
-        # Make current prediction (for the next candle)
-        current_data = df.iloc[-100:]  # Get last 100 candles
+        # Make current prediction
+        current_time = pd.Timestamp.now()
+        
+        # Get exactly the last 101 closed candles
+        closed_candles = df[df['close_time'] < current_time].tail(101)
+        if len(closed_candles) < 101:
+            st.error("Not enough closed candles for prediction")
+            st.stop()
+        
+        # Make prediction for the next candle
+        current_data = closed_candles.copy()
         current_scaled_data = prepare_data(current_data)
-        if len(current_scaled_data) == 100:  # Only predict if we have exactly 100 points
-            sequence = current_scaled_data.reshape(1, 100, current_scaled_data.shape[1])
+        
+        if len(current_scaled_data) == 101:  # Verify we have exactly 101 points
+            sequence = current_scaled_data.reshape(1, 101, current_scaled_data.shape[1])
             prediction = model.predict(sequence, verbose=0)[0]
             
             # Convert percentage predictions to actual prices
@@ -251,16 +271,11 @@ if len(df) >= 100:
                 current_price * (1 + prediction[2]/100)   # Close
             ])
             
-            # Ensure predictions follow candlestick logic
-            prediction_descaled = np.array([
-                max(prediction_descaled[0], current_price),  # High should be at least current price
-                min(prediction_descaled[1], current_price),  # Low should be at most current price
-                max(min(prediction_descaled[2], prediction_descaled[0]), prediction_descaled[1])  # Close between high and low
-            ])
+            # The next candle's timestamp (4 hours after last closed candle)
+            next_timestamp = closed_candles['timestamp'].iloc[-1] + pd.Timedelta(hours=4)
             
             # Add current prediction to historical predictions
-            next_timestamp = df['timestamp'].iloc[-1] + pd.Timedelta(hours=4)
-            st.session_state.historical_predictions.append({
+            current_prediction = {
                 'timestamp': next_timestamp,
                 'current_price': current_price,
                 'pred_high': prediction_descaled[0],
@@ -270,217 +285,239 @@ if len(df) >= 100:
                 'actual_low': None,
                 'actual_close': None,
                 'actual_open': None
-            })
-        else:
-            st.error("Not enough data points after preprocessing for current prediction")
-            st.stop()
-        
-        # Update historical predictions with actual values
-        for pred in st.session_state.historical_predictions:
-            if pred['actual_close'] is None:  # Only update if not already updated
-                actual_candle = df[df['timestamp'] == pred['timestamp']]
-                if not actual_candle.empty:
-                    pred['actual_high'] = actual_candle['high'].iloc[0]
-                    pred['actual_low'] = actual_candle['low'].iloc[0]
-                    pred['actual_close'] = actual_candle['close'].iloc[0]
-                    pred['actual_open'] = actual_candle['open'].iloc[0]
-        
-        # Keep only last 102 predictions
-        st.session_state.historical_predictions = st.session_state.historical_predictions[-102:]
-        
-        # Display current price and predictions
-        current_price = df['close'].iloc[-1]
-        
-        # Create columns for metrics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Current Price", f"${current_price:,.2f}")
-        with col2:
-            st.metric("Predicted High", f"${prediction_descaled[0]:,.2f}", 
-                     f"{((prediction_descaled[0] - current_price) / current_price * 100):+.2f}%")
-        with col3:
-            st.metric("Predicted Low", f"${prediction_descaled[1]:,.2f}", 
-                     f"{((prediction_descaled[1] - current_price) / current_price * 100):+.2f}%")
-        with col4:
-            st.metric("Predicted Close", f"${prediction_descaled[2]:,.2f}", 
-                     f"{((prediction_descaled[2] - current_price) / current_price * 100):+.2f}%")
-        
-        # Plot current prediction chart
-        st.subheader("Current Prediction")
-        fig = go.Figure()
-        
-        # Plot historical candles (last 102 candles)
-        fig.add_trace(go.Candlestick(
-            x=df['timestamp'].tail(102),
-            open=df['open'].tail(102),
-            high=df['high'].tail(102),
-            low=df['low'].tail(102),
-            close=df['close'].tail(102),
-            name="Historical"
-        ))
-        
-        # Add predicted values
-        fig.add_trace(go.Candlestick(
-            x=[next_timestamp],
-            open=[current_price],
-            high=[prediction_descaled[0]],
-            low=[prediction_descaled[1]],
-            close=[prediction_descaled[2]],
-            name="Prediction",
-            increasing_line_color='green',
-            decreasing_line_color='red'
-        ))
-        
-        fig.update_layout(
-            title="Price History and Current Prediction (Last 102 Candles)",
-            xaxis_title="Time",
-            yaxis_title="Price",
-            xaxis_rangeslider_visible=False,
-            height=600
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Plot historical predictions chart
-        st.subheader("Historical Predictions")
-        if st.session_state.historical_predictions:
-            hist_pred_df = pd.DataFrame(st.session_state.historical_predictions)
+            }
             
-            # Add previous close columns for both actual and predicted
-            hist_pred_df['prev_pred_close'] = hist_pred_df['pred_close'].shift(1)
-            hist_pred_df['prev_actual_close'] = hist_pred_df['actual_close'].shift(1)
+            # Update historical predictions list
+            if len(st.session_state.historical_predictions) >= 102:
+                # Remove oldest prediction if we already have 102
+                st.session_state.historical_predictions.pop(0)
+            st.session_state.historical_predictions.append(current_prediction)
             
-            fig2 = go.Figure()
+            # Display current price and predictions
+            col1, col2, col3, col4 = st.columns(4)
             
-            # Calculate colors based on comparing each close with previous close
-            colors = []
-            for i in range(len(hist_pred_df)):
-                if i == 0:
-                    colors.append('#26A69A')  # Default to green for first candle
-                else:
-                    prev_close = hist_pred_df['pred_close'].iloc[i-1]
-                    colors.append('#26A69A' if hist_pred_df['pred_close'].iloc[i] > prev_close else '#EF5350')
+            with col1:
+                st.metric("Current Price", f"${current_price:,.2f}")
+            with col2:
+                st.metric("Predicted High", f"${prediction_descaled[0]:,.2f}", 
+                         f"{((prediction_descaled[0] - current_price) / current_price * 100):+.2f}%")
+            with col3:
+                st.metric("Predicted Low", f"${prediction_descaled[1]:,.2f}", 
+                         f"{((prediction_descaled[1] - current_price) / current_price * 100):+.2f}%")
+            with col4:
+                st.metric("Predicted Close", f"${prediction_descaled[2]:,.2f}", 
+                         f"{((prediction_descaled[2] - current_price) / current_price * 100):+.2f}%")
+
+            # Display latest closed candle information
+            st.subheader("Latest Closed Candle Information")
+            latest_candle = closed_candles.iloc[-1]
+            latest_candle_time = latest_candle['timestamp']
             
-            # Plot predicted candles with explicit colors and using previous close as open
-            for i in range(len(hist_pred_df)):
-                open_price = hist_pred_df['prev_pred_close'].iloc[i] if i > 0 else hist_pred_df['current_price'].iloc[i]
-                fig2.add_trace(go.Candlestick(
-                    x=[hist_pred_df['timestamp'].iloc[i]],
-                    open=[open_price],
-                    high=[hist_pred_df['pred_high'].iloc[i]],
-                    low=[hist_pred_df['pred_low'].iloc[i]],
-                    close=[hist_pred_df['pred_close'].iloc[i]],
-                    name="Predicted",
-                    increasing=dict(line=dict(color=colors[i]), fillcolor=colors[i]),
-                    decreasing=dict(line=dict(color=colors[i]), fillcolor=colors[i]),
-                    showlegend=False
-                ))
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                st.metric("Last Candle Time", latest_candle_time.strftime('%Y-%m-%d %H:%M'))
+            with col2:
+                st.metric("Open", f"${latest_candle['open']:,.2f}")
+            with col3:
+                st.metric("High", f"${latest_candle['high']:,.2f}", 
+                         f"{((latest_candle['high'] - latest_candle['open']) / latest_candle['open'] * 100):+.2f}%")
+            with col4:
+                st.metric("Low", f"${latest_candle['low']:,.2f}", 
+                         f"{((latest_candle['low'] - latest_candle['open']) / latest_candle['open'] * 100):+.2f}%")
+            with col5:
+                st.metric("Close", f"${latest_candle['close']:,.2f}", 
+                         f"{((latest_candle['close'] - latest_candle['open']) / latest_candle['open'] * 100):+.2f}%")
             
-            # Add legend items for trend directions
-            fig2.add_trace(go.Scatter(
-                x=[hist_pred_df['timestamp'].iloc[0]],
-                y=[hist_pred_df['pred_high'].max()],
-                mode='markers',
-                marker=dict(color='#26A69A'),
-                name='Close > Previous Close',
-                showlegend=True
-            ))
-            fig2.add_trace(go.Scatter(
-                x=[hist_pred_df['timestamp'].iloc[0]],
-                y=[hist_pred_df['pred_high'].max()],
-                mode='markers',
-                marker=dict(color='#EF5350'),
-                name='Close < Previous Close',
-                showlegend=True
+            # Plot current prediction chart
+            st.subheader("Current Prediction")
+            fig = go.Figure()
+            
+            # Plot historical candles (last 101 closed candles)
+            fig.add_trace(go.Candlestick(
+                x=closed_candles['timestamp'],
+                open=closed_candles['open'],
+                high=closed_candles['high'],
+                low=closed_candles['low'],
+                close=closed_candles['close'],
+                name="Historical"
             ))
             
-            fig2.update_layout(
-                title="Historical Predictions (Last 102 Predictions)",
+            # Add predicted values with cyan color
+            fig.add_trace(go.Candlestick(
+                x=[next_timestamp],
+                open=[current_price],  # Use last actual close as open
+                high=[prediction_descaled[0]],
+                low=[prediction_descaled[1]],
+                close=[prediction_descaled[2]],
+                name="Next Prediction",
+                increasing_line_color='cyan',
+                decreasing_line_color='cyan',
+                increasing_fillcolor='cyan',
+                decreasing_fillcolor='cyan'
+            ))
+            
+            # Set exact range for 102 candles
+            fig.update_layout(
+                title="Price History and Current Prediction (Last 102 Candles)",
                 xaxis_title="Time",
                 yaxis_title="Price",
                 xaxis_rangeslider_visible=False,
-                height=600
+                height=600,
+                xaxis_range=[closed_candles['timestamp'].iloc[0], next_timestamp]
             )
             
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
             
-            # Display prediction accuracy metrics
-            actual_data = hist_pred_df[hist_pred_df['actual_close'].notna()]
-            if not actual_data.empty:
-                st.subheader("Prediction Accuracy Metrics")
+            # Plot historical predictions chart
+            st.subheader("Historical Predictions")
+            if st.session_state.historical_predictions:
+                hist_pred_df = pd.DataFrame(st.session_state.historical_predictions)
                 
-                # Calculate trend direction accuracy (comparing with previous close)
-                # We need to shift by 1 to compare each prediction with its corresponding actual
-                actual_data = actual_data.copy()  # Create a copy to avoid SettingWithCopyWarning
-                actual_data['prev_actual_close'] = df['close'].shift(1).loc[actual_data.index]
-                actual_trend = actual_data['actual_close'] > actual_data['prev_actual_close']
-                predicted_trend = actual_data['pred_close'] > actual_data['prev_actual_close']  # Compare with same previous close
+                fig2 = go.Figure()
                 
-                # Calculate accuracy
-                trend_matches = actual_trend == predicted_trend
-                trend_accuracy = np.sum(trend_matches) / len(trend_matches) if len(trend_matches) > 0 else 0
+                # Plot all predictions
+                for i in range(len(hist_pred_df)):
+                    # Get the open price (always use previous candle's predicted close)
+                    if i == 0:
+                        open_price = current_price  # Use current price only for the very first candle
+                    else:
+                        open_price = hist_pred_df['pred_close'].iloc[i-1]  # Use previous candle's predicted close
+                    
+                    # Use cyan color for the latest prediction, regular colors for others
+                    if i == len(hist_pred_df) - 1:
+                        fig2.add_trace(go.Candlestick(
+                            x=[hist_pred_df['timestamp'].iloc[i]],
+                            open=[open_price],
+                            high=[hist_pred_df['pred_high'].iloc[i]],
+                            low=[hist_pred_df['pred_low'].iloc[i]],
+                            close=[hist_pred_df['pred_close'].iloc[i]],
+                            name="Next Prediction",
+                            increasing_line_color='cyan',
+                            decreasing_line_color='cyan',
+                            increasing_fillcolor='cyan',
+                            decreasing_fillcolor='cyan'
+                        ))
+                    else:
+                        # Color based on predicted trend (comparing predicted close with open)
+                        color = '#26A69A' if hist_pred_df['pred_close'].iloc[i] > open_price else '#EF5350'
+                        fig2.add_trace(go.Candlestick(
+                            x=[hist_pred_df['timestamp'].iloc[i]],
+                            open=[open_price],
+                            high=[hist_pred_df['pred_high'].iloc[i]],
+                            low=[hist_pred_df['pred_low'].iloc[i]],
+                            close=[hist_pred_df['pred_close'].iloc[i]],
+                            name="Historical Predictions",
+                            increasing=dict(line=dict(color=color), fillcolor=color),
+                            decreasing=dict(line=dict(color=color), fillcolor=color),
+                            showlegend=False
+                        ))
                 
-                # Calculate accuracy metrics
-                high_mae = np.mean(np.abs(actual_data['actual_high'] - actual_data['pred_high']))
-                low_mae = np.mean(np.abs(actual_data['actual_low'] - actual_data['pred_low']))
-                close_mae = np.mean(np.abs(actual_data['actual_close'] - actual_data['pred_close']))
-                
-                # Display metrics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("High Price MAE", f"${high_mae:,.2f}")
-                with col2:
-                    st.metric("Low Price MAE", f"${low_mae:,.2f}")
-                with col3:
-                    st.metric("Close Price MAE", f"${close_mae:,.2f}")
-                with col4:
-                    st.metric("Trend Accuracy", f"{trend_accuracy:.1%}")
-                
-                # Add a chart showing prediction errors over time
-                error_df = pd.DataFrame({
-                    'timestamp': actual_data['timestamp'],
-                    'High Error': actual_data['actual_high'] - actual_data['pred_high'],
-                    'Low Error': actual_data['actual_low'] - actual_data['pred_low'],
-                    'Close Error': actual_data['actual_close'] - actual_data['pred_close']
-                })
-                
-                fig3 = go.Figure()
-                fig3.add_trace(go.Scatter(x=error_df['timestamp'], y=error_df['High Error'], 
-                                        name='High Error', line=dict(color='green')))
-                fig3.add_trace(go.Scatter(x=error_df['timestamp'], y=error_df['Low Error'], 
-                                        name='Low Error', line=dict(color='red')))
-                fig3.add_trace(go.Scatter(x=error_df['timestamp'], y=error_df['Close Error'], 
-                                        name='Close Error', line=dict(color='blue')))
-                
-                fig3.update_layout(
-                    title="Prediction Errors Over Time",
+                # Use same time range as current prediction chart
+                fig2.update_layout(
+                    title="Historical Predictions (Last 102 Predictions)",
                     xaxis_title="Time",
-                    yaxis_title="Error ($)",
-                    height=400
+                    yaxis_title="Price",
+                    xaxis_rangeslider_visible=False,
+                    height=600,
+                    xaxis_range=[closed_candles['timestamp'].iloc[0], next_timestamp]
                 )
                 
-                st.plotly_chart(fig3, use_container_width=True)
-        else:
-            st.info("No historical predictions available yet. Predictions will appear here as they are made.")
-        
-        # Trading signals
-        st.subheader("Trading Signals")
-        
-        # Compare with previous close for trading signals
-        last_pred = st.session_state.historical_predictions[-1]
-        prev_close = st.session_state.historical_predictions[-2]['pred_close'] if len(st.session_state.historical_predictions) > 1 else current_price
-        
-        if last_pred['pred_close'] > prev_close:
-            st.success("🔼 Bullish Signal: Predicted close is higher than previous close")
-            st.write(f"Potential Profit Target: ${last_pred['pred_high']:,.2f} (+{((last_pred['pred_high'] - current_price) / current_price * 100):,.2f}%)")
-        else:
-            st.error("🔽 Bearish Signal: Predicted close is lower than previous close")
-            st.write(f"Potential Drop to: ${last_pred['pred_low']:,.2f} ({((last_pred['pred_low'] - current_price) / current_price * 100):,.2f}%)")
-        
-        # Last update time
-        st.sidebar.write("Last Update:", df['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S'))
-    except Exception as e:
-        st.error(f"Error during prediction: {str(e)}")
-else:
-    st.error("Not enough historical data. Need at least 100 candles for prediction.") 
+                st.plotly_chart(fig2, use_container_width=True)
+                
+                # Display prediction accuracy metrics
+                actual_data = hist_pred_df[hist_pred_df['actual_close'].notna()]
+                if not actual_data.empty:
+                    st.subheader("Prediction Accuracy Metrics")
+                    
+                    # Calculate trend direction accuracy (comparing predicted direction vs actual direction)
+                    actual_data = actual_data.copy()  # Create a copy to avoid SettingWithCopyWarning
+                    
+                    # For each prediction, get its open (which is previous prediction's close)
+                    actual_data['pred_open'] = actual_data['pred_close'].shift(1)
+                    # For the first prediction, use the current price as open
+                    actual_data.loc[actual_data.index[0], 'pred_open'] = actual_data['current_price'].iloc[0]
+                    
+                    # Calculate predicted and actual trends
+                    predicted_trend = actual_data['pred_close'] > actual_data['pred_open']
+                    actual_trend = actual_data['actual_close'] > actual_data['actual_open']
+                    
+                    # Calculate accuracy
+                    trend_matches = predicted_trend == actual_trend
+                    trend_accuracy = np.sum(trend_matches) / len(trend_matches) if len(trend_matches) > 0 else 0
+                    
+                    # Add debug information
+                    st.write("Trend Direction Debug:")
+                    debug_df = pd.DataFrame({
+                        'Timestamp': actual_data['timestamp'],
+                        'Predicted Open': actual_data['pred_open'],
+                        'Predicted Close': actual_data['pred_close'],
+                        'Predicted Trend': predicted_trend,
+                        'Actual Open': actual_data['actual_open'],
+                        'Actual Close': actual_data['actual_close'],
+                        'Actual Trend': actual_trend,
+                        'Correct?': trend_matches
+                    })
+                    
+                    # Calculate and display percentage of correct predictions
+                    correct_predictions = debug_df['Correct?'].sum()
+                    total_predictions = len(debug_df)
+                    accuracy_percentage = (correct_predictions / total_predictions * 100) if total_predictions > 0 else 0
+                    st.write(f"**Overall Prediction Accuracy**: {accuracy_percentage:.2f}% ({correct_predictions} correct out of {total_predictions} predictions)")
+                    
+                    st.dataframe(debug_df)
+                    
+                    # Calculate accuracy metrics
+                    high_mae = np.mean(np.abs(actual_data['actual_high'] - actual_data['pred_high']))
+                    low_mae = np.mean(np.abs(actual_data['actual_low'] - actual_data['pred_low']))
+                    close_mae = np.mean(np.abs(actual_data['actual_close'] - actual_data['pred_close']))
+                    
+                    # Display metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("High Price MAE", f"${high_mae:,.2f}")
+                    with col2:
+                        st.metric("Low Price MAE", f"${low_mae:,.2f}")
+                    with col3:
+                        st.metric("Close Price MAE", f"${close_mae:,.2f}")
+                    with col4:
+                        st.metric("Trend Direction Accuracy", f"{trend_accuracy:.1%}")
+
+                    # Add timestamp verification
+                    st.write("### Timestamp Verification")
+                    st.write("Checking for potential timing mismatches between predictions and actual data...")
+                    
+                    # Get a few sample rows to check timestamps
+                    sample_data = actual_data.head()
+                    st.write("Sample prediction timestamps vs actual candle timestamps:")
+                    timestamp_df = pd.DataFrame({
+                        'Prediction Time': sample_data['timestamp'],
+                        'Actual Candle Time': [df['timestamp'].iloc[i] for i in sample_data.index],
+                        'Time Difference': [pred - actual for pred, actual in 
+                                         zip(sample_data['timestamp'], 
+                                             [df['timestamp'].iloc[i] for i in sample_data.index])]
+                    })
+                    st.dataframe(timestamp_df)
+            else:
+                st.info("No historical predictions available yet. Predictions will appear here as they are made.")
+            
+            # Trading signals
+            st.subheader("Trading Signals")
+            
+            # Compare with previous close for trading signals
+            last_pred = st.session_state.historical_predictions[-1]
+            prev_close = st.session_state.historical_predictions[-2]['pred_close'] if len(st.session_state.historical_predictions) > 1 else current_price
+            
+            if last_pred['pred_close'] > prev_close:
+                st.success("🔼 Bullish Signal: Predicted close is higher than previous close")
+                st.write(f"Potential Profit Target: ${last_pred['pred_high']:,.2f} (+{((last_pred['pred_high'] - current_price) / current_price * 100):,.2f}%)")
+            else:
+                st.error("🔽 Bearish Signal: Predicted close is lower than previous close")
+                st.write(f"Potential Drop to: ${last_pred['pred_low']:,.2f} ({((last_pred['pred_low'] - current_price) / current_price * 100):,.2f}%)")
+            
+            # Display last update time in sidebar
+            try:
+                st.sidebar.write("Last Update:", df['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S'))
+            except Exception as e:
+                st.error(f"Error displaying last update time: {str(e)}")
+    else:
+        st.error("Not enough historical data. Need at least 100 candles for prediction.")
